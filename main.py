@@ -88,8 +88,8 @@ def main():
         videos = get_latest_videos(channel_id)
 
         for video in videos:
-            if video.link in posted:
-                continue
+            # if video.link in posted:
+#     continue
 
             print(f"Downloading: {video.title}")
 
