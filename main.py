@@ -70,11 +70,16 @@ def send_to_telegram(file_path):
 
     try:
         with open(file_path, "rb") as video:
-            requests.post(
+            r = requests.post(
                 url,
                 data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"video": video}
             )
+
+        print("Telegram response:", r.text)
+
+    except Exception as e:
+        print("Telegram send failed:", e)
         print("Sent to Telegram ✅")
     except Exception as e:
         print("Telegram send failed:", e)
