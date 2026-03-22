@@ -1,24 +1,3 @@
-“””
-╔══════════════════════════════════════════════════════════════╗
-║           AI CLIP GENERATOR — COMPLETE ALL-IN-ONE            ║
-║  Drop this file in your project folder and run it.           ║
-║  It will auto-install dependencies, create all folders,      ║
-║  generate your .env template, and start the pipeline.        ║
-╚══════════════════════════════════════════════════════════════╝
-
-FIRST RUN SETUP:
-
-1. Run:  python main.py –setup
-   → Creates .env, folders, requirements.txt, README.md
-1. Fill in your API keys in the generated .env file
-1. Run:  python main.py
-   → Starts the full clip generation pipeline
-
-SYSTEM REQUIREMENT — ffmpeg must be installed:
-macOS:   brew install ffmpeg
-Ubuntu:  sudo apt install ffmpeg
-Windows: https://ffmpeg.org/download.html
-“””
 
 import os
 import sys
