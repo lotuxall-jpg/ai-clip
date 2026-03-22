@@ -42,8 +42,11 @@ def get_latest_videos(channel_id):
 # ====== DOWNLOAD VIDEO ======
 def download_video(url):
     ydl_opts = {
-        "format": "mp4",
-        "outtmpl": "video.%(ext)s",
+    "format": "best[ext=mp4]/best",
+    "outtmpl": "video.%(ext)s",
+    "noplaylist": True,
+    "quiet": False
+}
     }
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
