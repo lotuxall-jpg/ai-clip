@@ -13,7 +13,7 @@ YOUTUBE_CHANNEL_IDS = [
     "UCKDBMEtklUsdH-xJlyrBG7A"   # Plaqueboy Max
 ]
 
-TELEGRAM_BOT_TOKEN = "8699414099:AAGz5ipDMa54wJ1iFvI4a1pu25S6QhfLbgs"
+TELEGRAM_BOT_TOKEN = "8699414099:AAFufCbRt0QqsY8VYdoctASGym79DO3fIdk"
 TELEGRAM_CHAT_ID = "8205944221"
 
 LOG_FILE = "posted_log.json"
@@ -42,25 +42,42 @@ def get_latest_videos(channel_id):
 # ====== DOWNLOAD VIDEO ======
 def download_video(url):
     ydl_opts = {
-    "format": "best[ext=mp4]/best",
-    "outtmpl": "video.%(ext)s",
-    "noplaylist": True,
-    "quiet": False
-}
-    
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        "format": "best[ext=mp4]/best",
+        "outtmpl": "video.%(ext)s",
+        "noplaylist": True,
+        "quiet": False,
+        "nocheckcertificate": True,
+        "ignoreerrors": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android"]
+            }
+        }
+    }
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return True
+    except Exception as e:
+        print("Download failed:", e)
+        return False
 
 
 # ====== SEND TO TELEGRAM ======
 def send_to_telegram(file_path):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-    with open(file_path, "rb") as video:
-        requests.post(
-            url,
-            data={"chat_id": TELEGRAM_CHAT_ID},
-            files={"video": video}
-        )
+
+    try:
+        with open(file_path, "rb") as video:
+            requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID},
+                files={"video": video}
+            )
+        print("Sent to Telegram ✅")
+    except Exception as e:
+        print("Telegram send failed:", e)
 
 
 # ====== MAIN ======
@@ -75,7 +92,10 @@ def main():
                 continue
 
             print(f"Downloading: {video.title}")
-            download_video(video.link)
+
+            success = download_video(video.link)
+            if not success:
+                continue
 
             print("Sending to Telegram...")
             send_to_telegram("video.mp4")
