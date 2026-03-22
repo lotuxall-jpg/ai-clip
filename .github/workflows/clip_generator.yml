@@ -1,0 +1,115 @@
+name: 🎬 AI Clip Generator
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  generate-and-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 🎞️ Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            anthropic \
+            openai \
+            yt-dlp \
+            feedparser \
+            requests \
+            openai-whisper \
+            python-dotenv \
+            google-api-python-client \
+            google-auth-oauthlib \
+            google-auth
+
+      - name: 📋 Restore posted log
+        uses: actions/cache@v4
+        with:
+          path: posted_log.json
+          key: posted-log-${{ github.run_id }}
+          restore-keys: |
+            posted-log-
+
+      - name: 🎵 Restore assets cache
+        uses: actions/cache@v4
+        with:
+          path: assets/
+          key: assets-v1
+
+      - name: 🔐 Create .env from secrets
+        run: |
+          cat > .env << EOF
+          AI_PROVIDER=${{ secrets.AI_PROVIDER }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          TIKTOK_ACCESS_TOKEN=${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          AUTO_POST_TIKTOK=true
+          AUTO_POST_YOUTUBE=true
+          MAX_VIDEOS_PER_RUN=2
+          EOF
+
+      - name: 📺 Set up YouTube credentials
+        run: |
+          echo '${{ secrets.YOUTUBE_CLIENT_SECRETS }}' > client_secrets.json
+          echo '${{ secrets.YOUTUBE_TOKEN_PICKLE_B64 }}' | base64 -d > youtube_token.json || true
+
+      - name: 📁 Create folders
+        run: |
+          mkdir -p downloads clips output assets/music assets/sfx assets/branding
+
+      - name: 🚀 Run AI Clip Generator
+        run: python main.py
+        env:
+          AI_PROVIDER:          ${{ secrets.AI_PROVIDER }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          TIKTOK_ACCESS_TOKEN:  ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          AUTO_POST_TIKTOK:     "true"
+          AUTO_POST_YOUTUBE:    "true"
+
+      - name: 💾 Save posted log
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: posted_log.json
+          key: posted-log-${{ github.run_id }}
+
+      - name: 📤 Upload output clips
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clips-${{ github.run_number }}
+          path: output/
+          retention-days: 3
+
+      - name: 📋 Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: app.log
+          retention-days: 7
