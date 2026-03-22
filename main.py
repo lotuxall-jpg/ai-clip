@@ -1,553 +1,498 @@
 import os
-import sys
 import json
-import time
-import random
-import logging
-import argparse
+import glob
 import subprocess
-from pathlib import Path
+import asyncio
+import feedparser
+import requests
+import whisper
 
-REQUIRED_PACKAGES = {
-    "anthropic": "anthropic",
-    "openai": "openai",
-    "yt_dlp": "yt-dlp",
-    "feedparser": "feedparser",
-    "requests": "requests",
-    "whisper": "openai-whisper",
-    "dotenv": "python-dotenv",
-    "googleapiclient": "google-api-python-client",
-    "google_auth_oauthlib": "google-auth-oauthlib",
+# ── CONFIG ──────────────────────────────────────────────────
+LOG_FILE      = "posted_log.json"
+CHANNEL_IDS   = os.environ.get("YOUTUBE_CHANNEL_IDS", "").split(",")
+GEMINI_KEY    = os.environ.get("GEMINI_API_KEY", "")
+CLIP_LENGTH   = 55
+MAX_CLIPS     = 4
+WHISPER_MODEL = "base"
+
+VOICE_NAME     = "en-US-GuyNeural"
+VOICE_RATE     = "+10%"
+VOICE_MIX_MODE = "replace"
+
+STYLE = {
+    "font": "Impact", "font_size": 58,
+    "primary": "&H00FFFFFF", "highlight": "&H0000FFFF",
+    "outline": "&H00000000", "back": "&HA0000000",
+    "outline_size": 3, "shadow": 2, "bold": -1,
+    "margin_v": 120, "words_per_line": 3,
 }
 
-def install_dependencies():
-    for import_name, pip_name in REQUIRED_PACKAGES.items():
-        try:
-            __import__(import_name.split(".")[0])
-        except ImportError:
-            subprocess.run([sys.executable, "-m", "pip", "install", pip_name, "-q"], check=True)
+HOOKS = [
+    "WAIT FOR IT...", "YOU NEED TO SEE THIS",
+    "NOBODY TALKS ABOUT THIS", "THIS CHANGES EVERYTHING",
+    "PAY ATTENTION TO THIS", "WATCH TILL THE END",
+    "THIS IS INSANE", "I CAN'T BELIEVE THIS",
+]
 
-def load_env():
-    env_path = Path(".env")
-    if env_path.exists():
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-        except ImportError:
-            for line in env_path.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip())
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
-load_env()
-
-CONFIG = {
-    "AI_PROVIDER": os.getenv("AI_PROVIDER", "claude"),
-    "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
-    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
-    "YOUTUBE_CHANNEL_IDS": [
-        "UCWsDFclhY2DBi3GB5uykGXA",
-        "UCjiXtODGCCulmhwypZAWSag",
-        "UCoEmptob-eEGKk18c2VpIJg",
-        "UCGRryxFxjXbVAtBPE9EbyMg",
-        "UCKDBMEtklUsdH-xJlyrBG7A",
-    ],
-    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
-    "YOUTUBE_CLIENT_SECRETS": "client_secrets.json",
-    "YOUTUBE_TOKEN_FILE": "youtube_token.json",
-    "TIKTOK_ACCESS_TOKEN": os.getenv("TIKTOK_ACCESS_TOKEN", ""),
-    "CLIP_MIN_SECONDS": 20,
-    "CLIP_MAX_SECONDS": 59,
-    "CLIPS_PER_VIDEO": 3,
-    "OUTPUT_WIDTH": 1080,
-    "OUTPUT_HEIGHT": 1920,
-    "ENABLE_CAPTIONS": True,
-    "ENABLE_BACKGROUND_MUSIC": True,
-    "ENABLE_ZOOM_EFFECTS": True,
-    "ENABLE_COLOR_GRADING": True,
-    "ENABLE_INTRO_OUTRO": True,
-    "ADD_HOOK_TEXT": True,
-    "FAST_CUT_THRESHOLD": 0.7,
-    "DOWNLOAD_DIR": "downloads",
-    "CLIPS_DIR": "clips",
-    "OUTPUT_DIR": "output",
-    "MUSIC_DIR": "assets/music",
-    "SFX_DIR": "assets/sfx",
-    "BRANDING_DIR": "assets/branding",
-    "LOG_FILE": "posted_log.json",
-    "APP_LOG_FILE": "app.log",
-    "AUTO_POST_TIKTOK": os.getenv("AUTO_POST_TIKTOK", "true").lower() == "true",
-    "AUTO_POST_YOUTUBE": os.getenv("AUTO_POST_YOUTUBE", "true").lower() == "true",
-    "MAX_VIDEOS_PER_RUN": int(os.getenv("MAX_VIDEOS_PER_RUN", "2")),
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(CONFIG["APP_LOG_FILE"]),
-        logging.StreamHandler(),
-    ]
-)
-log = logging.getLogger(__name__)
-
-def setup_directories():
-    for d in [CONFIG["DOWNLOAD_DIR"], CONFIG["CLIPS_DIR"], CONFIG["OUTPUT_DIR"],
-              CONFIG["MUSIC_DIR"], CONFIG["SFX_DIR"], CONFIG["BRANDING_DIR"]]:
-        Path(d).mkdir(parents=True, exist_ok=True)
 
 def load_log():
-    if not os.path.exists(CONFIG["LOG_FILE"]):
-        return []
-    with open(CONFIG["LOG_FILE"]) as f:
-        return json.load(f)
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            return json.load(f)
+    return []
 
-def save_log(data):
-    with open(CONFIG["LOG_FILE"], "w") as f:
-        json.dump(data, f, indent=2)
 
-def telegram_alert(msg):
-    token = CONFIG["TELEGRAM_BOT_TOKEN"]
-    chat = CONFIG["TELEGRAM_CHAT_ID"]
-    if not token or not chat:
-        return
+def save_log(log):
+    with open(LOG_FILE, "w") as f:
+        json.dump(log, f)
+
+
+def clean_files():
+    for f in (glob.glob("clip_*.mp4") + glob.glob("source.*")
+              + glob.glob("*.ass") + glob.glob("vo_*.mp3")):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+
+# ── GET NEW VIDEOS FROM RSS ──────────────────────────────────
+def get_new_videos(channel_id, posted):
+    url  = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id.strip()}"
+    logger.info(f"Channel: {channel_id.strip()}")
     try:
-        import requests as req
-        req.post("https://api.telegram.org/bot" + token + "/sendMessage",
-                 data={"chat_id": chat, "text": msg}, timeout=10)
+        feed = feedparser.parse(url)
+        new  = [e.link for e in feed.entries if e.link not in posted]
+        return new[:2]  # get up to 2 new videos per channel
     except Exception as e:
-        log.warning("Telegram: " + str(e))
-
-def run_ffmpeg(args, label):
-    try:
-        subprocess.run(["ffmpeg", "-y"] + args, check=True, capture_output=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        log.warning("ffmpeg [" + label + "]: " + e.stderr.decode()[:250])
-        return False
-    except FileNotFoundError:
-        log.error("ffmpeg not found!")
-        return False
-
-class AIClient:
-    def __init__(self):
-        self.provider = CONFIG["AI_PROVIDER"].lower()
-        if self.provider == "claude":
-            import anthropic as _a
-            self._c = _a.Anthropic(api_key=CONFIG["ANTHROPIC_API_KEY"])
-            log.info("AI: Claude ready")
-        elif self.provider == "chatgpt":
-            from openai import OpenAI as _O
-            self._c = _O(api_key=CONFIG["OPENAI_API_KEY"])
-            log.info("AI: ChatGPT ready")
-        else:
-            raise ValueError("Unknown AI_PROVIDER. Use claude or chatgpt.")
-
-    def chat(self, system, user):
-        if self.provider == "claude":
-            r = self._c.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=1500,
-                system=system,
-                messages=[{"role": "user", "content": user}]
-            )
-            return r.content[0].text.strip()
-        else:
-            r = self._c.chat.completions.create(
-                model="gpt-4o",
-                max_tokens=1500,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ]
-            )
-            return r.choices[0].message.content.strip()
-
-def get_latest_videos(channel_id):
-    import feedparser
-    try:
-        feed = feedparser.parse("https://www.youtube.com/feeds/videos.xml?channel_id=" + channel_id)
-        return feed.entries
-    except Exception as e:
-        log.error("Feed error: " + str(e))
+        logger.error(f"RSS error: {e}")
         return []
 
-def download_video(url, out):
-    from yt_dlp import YoutubeDL
-    opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl": out,
-        "noplaylist": True,
-        "quiet": False,
-        "nocheckcertificate": True,
-        "ignoreerrors": True,
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-    }
-    try:
-        with YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        return os.path.exists(out)
-    except Exception as e:
-        log.error("Download failed: " + str(e))
-        return False
 
-def transcribe_video(path):
-    try:
-        import whisper
-        log.info("Transcribing...")
-        result = whisper.load_model("base").transcribe(path)
-        log.info("Transcription done")
-        return result
-    except ImportError:
-        log.warning("Whisper not available")
-        return {"text": "", "segments": []}
-    except Exception as e:
-        log.error("Transcription error: " + str(e))
-        return {"text": "", "segments": []}
+# ── DOWNLOAD VIDEO (no cookies needed) ───────────────────────
+def download_video(url):
+    logger.info(f"Processing: {url.split('v=')[-1] if 'v=' in url else url}")
 
-def analyse_clips(ai, transcript, title):
-    if not transcript.get("segments"):
-        return []
-    segs = "\n".join(
-        "[" + str(round(s["start"],1)) + "s-" + str(round(s["end"],1)) + "s]: " + s["text"]
-        for s in transcript["segments"]
-    )
-    system = "You are a viral short-form video editor. Find the best highlight moments. Return valid JSON only."
-    user = (
-        "Video: " + title + "\n"
-        "Transcript:\n" + segs + "\n\n"
-        "Find the " + str(CONFIG["CLIPS_PER_VIDEO"]) + " best clips "
-        "(" + str(CONFIG["CLIP_MIN_SECONDS"]) + "-" + str(CONFIG["CLIP_MAX_SECONDS"]) + "s each).\n"
-        "Return JSON array: [{\"start\": 45.2, \"end\": 78.5, \"reason\": \"funny moment\", "
-        "\"hook\": \"Watch this\", \"engagement_score\": 0.92, \"caption_style\": \"bold_animated\"}]"
-    )
-    try:
-        clips = json.loads(ai.chat(system, user))
-        log.info("AI found " + str(len(clips)) + " clips")
-        return clips
-    except Exception as e:
-        log.error("AI analysis failed: " + str(e))
-        return []
-
-def fallback_split(path):
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True
-        )
-        dur = float(r.stdout.strip())
-    except Exception:
-        dur = 180.0
-    clip_len = min(CONFIG["CLIP_MAX_SECONDS"], max(CONFIG["CLIP_MIN_SECONDS"], dur / CONFIG["CLIPS_PER_VIDEO"]))
-    return [
-        {"start": i * clip_len, "end": min((i+1)*clip_len, dur),
-         "reason": "Auto segment", "hook": "Watch this",
-         "engagement_score": 0.75, "caption_style": "bold_animated"}
-        for i in range(CONFIG["CLIPS_PER_VIDEO"])
-        if min((i+1)*clip_len, dur) - i*clip_len >= CONFIG["CLIP_MIN_SECONDS"]
+    # Method 1: Use Android client (no sign-in needed)
+    opts_android = [
+        "yt-dlp",
+        "--extractor-args", "youtube:player_client=android",
+        "--format", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
+        "--output", "source.%(ext)s",
+        "--no-playlist",
+        "--socket-timeout", "30",
+        "--retries", "3",
+        "--quiet",
+        url
     ]
 
-def generate_captions(ai, text, style):
-    system = "You are a TikTok caption writer. Max 5 words per line. Return valid JSON only."
-    user = "Style: " + style + "\nText: " + text + "\nReturn: [{\"text\": \"CAPTION\", \"start_offset\": 0.0, \"duration\": 1.5}]"
+    result = subprocess.run(opts_android, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        files = glob.glob("source.*")
+        if files:
+            size = os.path.getsize(files[0]) / (1024*1024)
+            logger.info(f"Downloaded: {files[0]} ({size:.1f}MB)")
+            return files[0]
+
+    # Method 2: Try iOS client
+    logger.info("Trying iOS client...")
+    opts_ios = [
+        "yt-dlp",
+        "--extractor-args", "youtube:player_client=ios",
+        "--format", "best[ext=mp4][height<=480]/best",
+        "--output", "source.%(ext)s",
+        "--no-playlist",
+        "--socket-timeout", "30",
+        "--quiet",
+        url
+    ]
+
+    result2 = subprocess.run(opts_ios, capture_output=True, text=True)
+
+    if result2.returncode == 0:
+        files = glob.glob("source.*")
+        if files:
+            return files[0]
+
+    # Method 3: Try web client with different user agent
+    logger.info("Trying web client...")
+    opts_web = [
+        "yt-dlp",
+        "--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+        "--format", "best[height<=480]/best",
+        "--output", "source.%(ext)s",
+        "--no-playlist",
+        "--socket-timeout", "30",
+        "--quiet",
+        url
+    ]
+
+    result3 = subprocess.run(opts_web, capture_output=True, text=True)
+
+    if result3.returncode == 0:
+        files = glob.glob("source.*")
+        if files:
+            return files[0]
+
+    logger.error(f"All download methods failed for {url}")
+    logger.error(result.stderr[-300:] if result.stderr else "No error output")
+    return None
+
+
+def get_duration(path):
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True)
     try:
-        return json.loads(ai.chat(system, user))
+        return float(r.stdout.strip())
     except Exception:
-        words = text.split()
-        chunks = [" ".join(words[i:i+5]) for i in range(0, min(len(words), 25), 5)]
-        return [{"text": c, "start_offset": i*2.0, "duration": 2.0} for i, c in enumerate(chunks)]
+        return 0
 
-def extract_clip(src, start, end, out):
-    return run_ffmpeg(["-ss", str(start), "-i", src, "-t", str(end-start),
-                       "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", out], "extract")
 
-def convert_to_vertical(src, out):
-    w = str(CONFIG["OUTPUT_WIDTH"])
-    h = str(CONFIG["OUTPUT_HEIGHT"])
-    return run_ffmpeg([
-        "-i", src,
-        "-filter_complex",
-        "[0:v]scale=" + w + ":" + h + ":force_original_aspect_ratio=increase,crop=" + w + ":" + h + ",boxblur=20:20[bg];[0:v]scale=" + w + ":-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[out]",
-        "-map", "[out]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-shortest", out
-    ], "vertical")
+# ── TRANSCRIBE ───────────────────────────────────────────────
+def transcribe(path):
+    logger.info("Transcribing with Whisper...")
+    model  = whisper.load_model(WHISPER_MODEL)
+    result = model.transcribe(path, fp16=False, word_timestamps=True)
+    segs   = result.get("segments", [])
+    logger.info(f"Got {len(segs)} segments")
+    return segs
 
-def apply_color_grade(src, out):
-    if not CONFIG["ENABLE_COLOR_GRADING"]:
-        return False
-    return run_ffmpeg(["-i", src,
-                       "-vf", "eq=contrast=1.15:brightness=0.02:saturation=1.3,colorchannelmixer=rr=1.05:gg=1.0:bb=0.95",
-                       "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", out], "grade")
 
-def add_captions_ffmpeg(src, caps, out):
-    if not CONFIG["ENABLE_CAPTIONS"] or not caps:
-        return False
-    filters = []
-    for c in caps:
-        txt = c["text"].replace("'", "\\'").replace(":", "\\:").upper()
-        t0 = c.get("start_offset", 0.0)
-        t1 = t0 + c.get("duration", 2.0)
-        filters.append(
-            "drawtext=text='" + txt + "':fontsize=72:fontcolor=white:borderw=4:bordercolor=black"
-            ":x=(w-text_w)/2:y=h*0.72:enable='between(t," + str(t0) + "," + str(t1) + ")'"
-        )
-    return run_ffmpeg(["-i", src, "-vf", ",".join(filters),
-                       "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", out], "captions")
+# ── FIND CLIPS ───────────────────────────────────────────────
+def find_clips(segs, dur):
+    if not segs:
+        clips, t = [], 10
+        while t + CLIP_LENGTH < dur - 10 and len(clips) < MAX_CLIPS:
+            clips.append({"start": t, "end": t + CLIP_LENGTH})
+            t += CLIP_LENGTH + 5
+        return clips
+    windows, i = [], 0
+    while i < len(segs):
+        s = segs[i]["start"]
+        e, w, j = s, 0, i
+        while j < len(segs) and segs[j]["end"] - s <= CLIP_LENGTH:
+            e = segs[j]["end"]
+            w += len(segs[j]["text"].split())
+            j += 1
+        if e > s:
+            windows.append({"start": s, "end": e, "score": w / (e - s)})
+        i = max(j, i + 1)
+    top = sorted(windows, key=lambda x: -x["score"])[:MAX_CLIPS]
+    return sorted(top, key=lambda x: x["start"])
 
-def add_background_music(src, out):
-    if not CONFIG["ENABLE_BACKGROUND_MUSIC"]:
-        return False
-    files = list(Path(CONFIG["MUSIC_DIR"]).glob("*.mp3")) + list(Path(CONFIG["MUSIC_DIR"]).glob("*.m4a"))
-    if not files:
-        return False
-    music = str(random.choice(files))
-    return run_ffmpeg(["-i", src, "-stream_loop", "-1", "-i", music,
-                       "-filter_complex", "[1:a]volume=0.15[m];[0:a][m]amix=inputs=2:duration=first[aout]",
-                       "-map", "0:v", "-map", "[aout]",
-                       "-c:v", "copy", "-c:a", "aac", "-shortest", out], "music")
 
-def add_zoom_effects(src, out):
-    if not CONFIG["ENABLE_ZOOM_EFFECTS"]:
-        return False
-    return run_ffmpeg(["-i", src,
-                       "-vf", "zoompan=z='if(lte(mod(time,10),0.5),1.05,1)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-                       "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", out], "zoom")
+# ── ASS SUBTITLES ────────────────────────────────────────────
+def ts(sec):
+    h  = int(sec // 3600)
+    m  = int((sec % 3600) // 60)
+    s  = int(sec % 60)
+    cs = int(round((sec - int(sec)) * 100))
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-def add_hook_overlay(src, hook, out):
-    if not CONFIG["ADD_HOOK_TEXT"] or not hook:
-        return False
-    txt = hook.upper().replace("'", "\\'").replace(":", "\\:")
-    return run_ffmpeg(["-i", src,
-                       "-vf", "drawtext=text='" + txt + "':fontsize=80:fontcolor=yellow:borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:enable='between(t,0,2.5)'",
-                       "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", out], "hook")
 
-def add_intro_outro(src, out, channel="ClipBot"):
-    if not CONFIG["ENABLE_INTRO_OUTRO"]:
-        return False
-    intro = Path(CONFIG["BRANDING_DIR"]) / "intro.mp4"
-    outro = Path(CONFIG["BRANDING_DIR"]) / "outro.mp4"
-    if intro.exists() and outro.exists():
-        lst = Path(CONFIG["CLIPS_DIR"]) / "concat.txt"
-        lst.write_text("file '" + str(intro.absolute()) + "'\nfile '" + str(Path(src).absolute()) + "'\nfile '" + str(outro.absolute()) + "'\n")
-        return run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(lst),
-                           "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", out], "concat")
-    brand = channel.upper().replace("'", "\\'")
-    return run_ffmpeg(["-i", src,
-                       "-vf", "drawtext=text='" + brand + "':fontsize=40:fontcolor=white:alpha=0.7:x=20:y=20",
-                       "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", out], "brand")
+def build_ass(segs, cs, ce, path):
+    S   = STYLE
+    hdr = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
 
-def process_clip(ai, source, clip, idx, title):
-    import shutil
-    b = "clip_" + str(idx) + "_" + str(int(time.time()))
-    cd = Path(CONFIG["CLIPS_DIR"])
-    od = Path(CONFIG["OUTPUT_DIR"])
-    raw = str(cd / (b + "_1_raw.mp4"))
-    vertical = str(cd / (b + "_2_vert.mp4"))
-    graded = str(cd / (b + "_3_grade.mp4"))
-    captioned = str(cd / (b + "_4_cap.mp4"))
-    musiced = str(cd / (b + "_5_music.mp4"))
-    zoomed = str(cd / (b + "_6_zoom.mp4"))
-    hooked = str(cd / (b + "_7_hook.mp4"))
-    final = str(od / (b + "_FINAL.mp4"))
-    cur = source
-    log.info("Extracting " + str(clip["start"]) + "s-" + str(clip["end"]) + "s")
-    if not extract_clip(cur, clip["start"], clip["end"], raw):
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,{S['font']},{S['font_size']},{S['primary']},{S['highlight']},{S['outline']},{S['back']},{S['bold']},0,0,0,100,100,0,0,3,{S['outline_size']},{S['shadow']},2,30,30,{S['margin_v']},1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+    evts = []
+    for seg in segs:
+        if seg["end"] <= cs or seg["start"] >= ce:
+            continue
+        words = []
+        for w in seg.get("words", []):
+            ws = max(w["start"], cs) - cs
+            we = min(w["end"],   ce) - cs
+            if we > ws:
+                words.append({"word": w["word"].strip(), "start": ws, "end": we})
+        if not words:
+            txt  = seg["text"].strip().split()
+            d    = max(seg["end"] - seg["start"], .1) / max(len(txt), 1)
+            base = max(seg["start"] - cs, 0)
+            for idx, ww in enumerate(txt):
+                words.append({"word": ww, "start": base + idx*d, "end": base + (idx+1)*d})
+        n = S["words_per_line"]
+        for ci in range(0, len(words), n):
+            chunk = words[ci:ci+n]
+            if not chunk:
+                continue
+            ls = chunk[0]["start"]
+            le = chunk[-1]["end"]
+            parts = [f"{{\\k{max(int(round((ww['end']-ww['start'])*100)),1)}}}{ww['word']}"
+                     for ww in chunk]
+            evts.append(f"Dialogue: 0,{ts(ls)},{ts(le)},Default,,0,0,0,,{' '.join(parts)}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(hdr + "\n".join(evts))
+    return path
+
+
+# ── HOOK TEXT ────────────────────────────────────────────────
+def get_hook(text, i):
+    if not GEMINI_KEY:
+        return HOOKS[i % len(HOOKS)]
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text":
+                f'Transcript: "{text[:300]}"\n'
+                f'Write ONE punchy hook 4-6 words MAX in ALL CAPS for a TikTok. '
+                f'No hashtags. No quotes. Reply with ONLY the hook text.'}]}]},
+            timeout=20)
+        h = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
+        h = h.replace('"', '').replace("'", '').strip()
+        return h if len(h) <= 40 else HOOKS[i % len(HOOKS)]
+    except Exception:
+        return HOOKS[i % len(HOOKS)]
+
+
+# ── VOICEOVER ────────────────────────────────────────────────
+async def _tts(text, path):
+    import edge_tts
+    await edge_tts.Communicate(text, VOICE_NAME, rate=VOICE_RATE).save(path)
+
+
+def gen_vo(text, path):
+    if not text.strip():
         return None
-    cur = raw
-    if convert_to_vertical(cur, vertical):
-        cur = vertical
-    if apply_color_grade(cur, graded):
-        cur = graded
-    caps = generate_captions(ai, clip.get("reason", title), clip.get("caption_style", "bold_animated"))
-    if add_captions_ffmpeg(cur, caps, captioned):
-        cur = captioned
-    if add_background_music(cur, musiced):
-        cur = musiced
-    if add_zoom_effects(cur, zoomed):
-        cur = zoomed
-    if add_hook_overlay(cur, clip.get("hook", "Watch this"), hooked):
-        cur = hooked
-    if add_intro_outro(cur, final):
-        cur = final
-    if cur != final:
-        shutil.copy2(cur, final)
-    log.info("Clip ready: " + final)
-    return final
+    try:
+        asyncio.run(_tts(text.strip(), path))
+        return path if os.path.exists(path) and os.path.getsize(path) > 0 else None
+    except Exception as e:
+        logger.warning(f"Voiceover failed: {e}")
+        return None
 
-def review_clip(ai, clip, title):
-    system = "You are a TikTok/YouTube content moderation expert. Return valid JSON only."
-    user = (
-        "Source: " + title + "\n"
-        "Reason: " + clip.get("reason", "N/A") + "\n"
-        "Return JSON: {\"approved\": true, \"monetisation_safe\": true, \"issues\": [], "
-        "\"tiktok_title\": \"title\", \"youtube_title\": \"title\", "
-        "\"description\": \"desc\", \"hashtags\": [\"#viral\"], \"tiktok_hashtags\": \"#viral #fyp\"}"
+
+# ── RENDER CLIP ──────────────────────────────────────────────
+def render(src, start, end, idx, segs, hook, vo):
+    out = f"clip_{idx:02d}.mp4"
+    ass = f"sub_{idx:02d}.ass"
+    raw = f"raw_{idx:02d}.mp4"
+    build_ass(segs, start, end, ass)
+    he  = hook.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    vf  = (
+        f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920:flags=lanczos,ass={ass},"
+        f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+        f"text='{he}':fontsize=62:fontcolor=white:bordercolor=black:borderw=4:"
+        f"shadowcolor=black@0.8:shadowx=3:shadowy=3:x=(w-text_w)/2:y=80:"
+        f"box=1:boxcolor=black@0.45:boxborderw=18"
     )
-    try:
-        return json.loads(ai.chat(system, user))
-    except Exception as e:
-        log.error("Review failed: " + str(e))
-        return {
-            "approved": True, "monetisation_safe": True, "issues": [],
-            "tiktok_title": title[:100], "youtube_title": title[:100],
-            "description": "Viral clip #shorts",
-            "hashtags": ["#viral", "#fyp", "#shorts"],
-            "tiktok_hashtags": "#viral #fyp #shorts",
-        }
+    if vo and os.path.exists(vo) and VOICE_MIX_MODE == "replace":
+        r1 = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", src,
+             "-vf", vf, "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "22", raw],
+            capture_output=True)
+        if r1.returncode == 0:
+            r2 = subprocess.run(
+                ["ffmpeg", "-y", "-i", raw, "-i", vo,
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-shortest", "-movflags", "+faststart", out],
+                capture_output=True)
+            for f in [raw, ass]:
+                try: os.remove(f)
+                except: pass
+            if r2.returncode == 0:
+                logger.info(f"✓ {out} (with voiceover)")
+                return out
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", src,
+         "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out],
+        capture_output=True)
+    try: os.remove(ass)
+    except: pass
+    if r.returncode == 0:
+        logger.info(f"✓ {out}")
+        return out
+    logger.error(f"Render failed for {out}")
+    return None
 
-def post_to_tiktok(path, title, hashtags):
-    if not CONFIG["AUTO_POST_TIKTOK"]:
+
+# ── POST TO TIKTOK ───────────────────────────────────────────
+def post_tiktok(clip, caption):
+    session_id = os.environ.get("TIKTOK_SESSION_ID", "")
+    if not session_id:
+        logger.info("No TikTok session ID — skipping")
         return False
-    token = CONFIG["TIKTOK_ACCESS_TOKEN"]
+    size = os.path.getsize(clip)
+    hdrs = {
+        "Cookie": f"sessionid={session_id}",
+        "User-Agent": "com.zhiliaoapp.musically/2022600030 (Linux; U; Android 10; en_US)",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(
+        "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+        headers=hdrs,
+        json={"source": "DATA", "video_size": size, "chunk_size": size, "total_chunk_count": 1},
+        timeout=30)
+    d  = r.json().get("data", {})
+    up = d.get("upload_url")
+    pid = d.get("publish_id")
+    if not up:
+        logger.error(f"TikTok init failed: {r.text[:150]}")
+        return False
+    with open(clip, "rb") as f:
+        requests.put(up, headers={"Content-Type": "video/mp4",
+                                   "Content-Range": f"bytes 0-{size-1}/{size}"},
+                     data=f, timeout=300)
+    r2 = requests.post(
+        "https://open.tiktokapis.com/v2/post/publish/video/init/",
+        headers=hdrs,
+        json={"publish_id": pid,
+              "post_info": {"title": caption, "privacy_level": "PUBLIC_TO_EVERYONE"},
+              "source_info": {"source": "FILE_UPLOAD"}},
+        timeout=30)
+    ok = r2.status_code == 200
+    logger.info(f"{'✓' if ok else '✗'} TikTok: {clip}")
+    return ok
+
+
+# ── POST TO YOUTUBE ──────────────────────────────────────────
+def get_yt_token():
+    r = requests.post("https://oauth2.googleapis.com/token",
+        data={"client_id":     os.environ.get("YOUTUBE_CLIENT_ID", ""),
+              "client_secret": os.environ.get("YOUTUBE_CLIENT_SECRET", ""),
+              "refresh_token": os.environ.get("YOUTUBE_REFRESH_TOKEN", ""),
+              "grant_type":    "refresh_token"},
+        timeout=30)
+    return r.json().get("access_token")
+
+
+def post_youtube(clip, title, desc):
+    token = get_yt_token()
     if not token:
-        log.warning("TikTok token not set")
+        logger.error("Could not get YouTube token")
         return False
-    try:
-        import requests as req
-        size = os.path.getsize(path)
-        hdrs = {"Authorization": "Bearer " + token, "Content-Type": "application/json; charset=UTF-8"}
-        init = req.post(
-            "https://open.tiktokapis.com/v2/post/publish/video/init/",
-            headers=hdrs,
-            json={
-                "post_info": {"title": (title + " " + hashtags)[:2200],
-                              "privacy_level": "PUBLIC_TO_EVERYONE",
-                              "disable_duet": False, "disable_comment": False, "disable_stitch": False},
-                "source_info": {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": size, "total_chunk_count": 1}
-            },
-            timeout=30
-        ).json()
-        if "data" not in init:
-            log.error("TikTok init failed: " + str(init))
-            return False
-        upload_url = init["data"]["upload_url"]
-        pub_id = init["data"]["publish_id"]
-        with open(path, "rb") as f:
-            data = f.read()
-        up = req.put(upload_url,
-                     headers={"Content-Range": "bytes 0-" + str(size-1) + "/" + str(size),
-                               "Content-Length": str(size), "Content-Type": "video/mp4"},
-                     data=data, timeout=300)
-        if up.status_code not in (200, 201, 204):
-            log.error("TikTok upload failed: " + up.text)
-            return False
-        log.info("TikTok posted! id=" + str(pub_id))
-        return True
-    except Exception as e:
-        log.error("TikTok error: " + str(e))
+    size = os.path.getsize(clip)
+    meta = {
+        "snippet": {"title": title, "description": desc,
+                    "tags": ["shorts", "viral", "trending"], "categoryId": "22"},
+        "status":  {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
+    }
+    init = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                 "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)},
+        json=meta, timeout=30)
+    if init.status_code != 200:
+        logger.error(f"YouTube init failed: {init.text[:150]}")
         return False
+    up = init.headers.get("Location")
+    with open(clip, "rb") as f:
+        r = requests.put(up, headers={"Content-Type": "video/mp4",
+                                       "Content-Length": str(size)},
+                         data=f, timeout=300)
+    ok  = r.status_code in (200, 201)
+    vid = r.json().get("id", "?") if ok else ""
+    logger.info(f"{'✓' if ok else '✗'} YouTube: {clip}{(' → youtu.be/'+vid) if ok else ''}")
+    return ok
 
-def post_to_youtube(path, title, description, tags):
-    if not CONFIG["AUTO_POST_YOUTUBE"]:
-        return False
-    try:
-        from google.oauth2.credentials import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from google.auth.transport.requests import Request
-        import pickle
-        SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-        tf = CONFIG["YOUTUBE_TOKEN_FILE"]
-        sf = CONFIG["YOUTUBE_CLIENT_SECRETS"]
-        creds = None
-        if os.path.exists(tf):
-            with open(tf, "rb") as f:
-                creds = pickle.load(f)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not os.path.exists(sf):
-                    log.warning("client_secrets.json missing")
-                    return False
-                creds = InstalledAppFlow.from_client_secrets_file(sf, SCOPES).run_local_server(port=0)
-            with open(tf, "wb") as f:
-                pickle.dump(creds, f)
-        yt = build("youtube", "v3", credentials=creds)
-        body = {
-            "snippet": {"title": (title + " #shorts")[:100],
-                        "description": description + "\n\n#shorts",
-                        "tags": tags + ["shorts", "viral"],
-                        "categoryId": "22"},
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
-        }
-        request = yt.videos().insert(part=",".join(body.keys()), body=body,
-                                      media_body=MediaFileUpload(path, mimetype="video/mp4", resumable=True))
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                log.info("YouTube upload: " + str(int(status.progress()*100)) + "%")
-        log.info("YouTube posted! id=" + response["id"])
-        return True
-    except ImportError:
-        log.warning("YouTube API libs not installed")
-        return False
-    except Exception as e:
-        log.error("YouTube error: " + str(e))
-        return False
 
-def main():
-    log.info("AI Clip Generator starting...")
-    log.info("Provider: " + CONFIG["AI_PROVIDER"].upper())
-    setup_directories()
-    posted = load_log()
-    telegram_alert("AI Clip Generator started")
-    try:
-        ai = AIClient()
-    except Exception as e:
-        log.critical("AI init failed: " + str(e))
-        telegram_alert("AI init failed: " + str(e))
-        return
-    processed = 0
-    for channel_id in CONFIG["YOUTUBE_CHANNEL_IDS"]:
-        if processed >= CONFIG["MAX_VIDEOS_PER_RUN"]:
-            break
-        log.info("Channel: " + channel_id)
-        for video in get_latest_videos(channel_id):
-            if processed >= CONFIG["MAX_VIDEOS_PER_RUN"]:
-                break
-            if video.link in posted:
-                continue
-            log.info("Processing: " + video.title)
-            telegram_alert("Processing: " + video.title)
-            ts = int(time.time())
-            src = str(Path(CONFIG["DOWNLOAD_DIR"]) / ("source_" + str(ts) + ".mp4"))
-            if not download_video(video.link, src):
-                continue
-            transcript = transcribe_video(src)
-            clips = analyse_clips(ai, transcript, video.title) or fallback_split(src)
-            for i, clip in enumerate(clips):
-                review = review_clip(ai, clip, video.title)
-                if not review.get("approved") or not review.get("monetisation_safe"):
-                    continue
-                final = process_clip(ai, src, clip, i, video.title)
-                if not final:
-                    continue
-                tt = post_to_tiktok(final, review["tiktok_title"], review["tiktok_hashtags"])
-                yt = post_to_youtube(final, review["youtube_title"], review["description"],
-                                     [h.lstrip("#") for h in review.get("hashtags", [])])
-                status = ("TikTok: " + ("OK" if tt else "skipped") + " | YouTube: " + ("OK" if yt else "skipped"))
-                log.info(status)
-                telegram_alert("Clip posted!\n" + video.title[:50] + "\n" + status)
-            posted.append(video.link)
-            save_log(posted)
-            processed += 1
-            time.sleep(3)
-    log.info("Done. Processed " + str(processed) + " videos.")
-    telegram_alert("Done. Processed " + str(processed) + " videos.")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--setup", action="store_true")
-    parser.add_argument("--install", action="store_true")
-    args = parser.parse_args()
-    if args.setup or args.install:
-        install_dependencies()
+# ── GENERATE CAPTIONS ────────────────────────────────────────
+def make_caption(text, platform, i):
+    if platform == "tiktok":
+        prompt = (f"Write a TikTok caption for viral clip {i+1}. "
+                  f"Hook under 10 words. Under 150 chars. "
+                  f"End with #fyp #viral #trending + 2 hashtags. Caption only.")
+        fallback = f"You won't believe this 🤯 #fyp #viral #trending #clips"
     else:
-        install_dependencies()
-        main()
+        prompt = (f"Write a YouTube Shorts title for clip {i+1}. "
+                  f"Under 60 chars. Curiosity-driven. End with #Shorts. Title only.")
+        fallback = f"You Need To See This 👀 #Shorts"
+
+    if not GEMINI_KEY:
+        return fallback
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=20)
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        return fallback
+
+
+# ── MAIN ─────────────────────────────────────────────────────
+if __name__ == "__main__":
+    logger.info("AI Clip Generator starting...")
+    logger.info(f"Provider: CLAUDE")
+
+    try:
+        import edge_tts
+        logger.info("edge-tts ready")
+    except ImportError:
+        logger.warning("edge-tts not installed — voiceover skipped")
+
+    clean_files()
+
+    posted   = load_log()
+    channels = [c.strip() for c in CHANNEL_IDS if c.strip()]
+    total    = 0
+
+    for ch in channels:
+        logger.info(f"Channel: {ch}")
+        for url in get_new_videos(ch, posted):
+            src = download_video(url)
+            if not src:
+                logger.warning(f"Skipping {url} — download failed")
+                posted.append(url)
+                save_log(posted)
+                continue
+
+            dur = get_duration(src)
+            if dur < CLIP_LENGTH + 20:
+                logger.warning("Video too short — skipping")
+                posted.append(url)
+                save_log(posted)
+                try: os.remove(src)
+                except: pass
+                continue
+
+            segs  = transcribe(src)
+            clips = find_clips(segs, dur)
+
+            for i, clip in enumerate(clips):
+                win  = " ".join(s["text"] for s in segs
+                                if s["start"] >= clip["start"] and s["end"] <= clip["end"]).strip()
+                hook = get_hook(win, i)
+                vo   = gen_vo(win, f"vo_{i+total:02d}.mp3")
+                out  = render(src, clip["start"], clip["end"], i + total, segs, hook, vo)
+
+                if vo and os.path.exists(vo):
+                    try: os.remove(vo)
+                    except: pass
+
+                if out:
+                    # Post to TikTok
+                    tt_cap = make_caption(win, "tiktok", i)
+                    post_tiktok(out, tt_cap)
+
+                    # Post to YouTube
+                    yt_title = make_caption(win, "youtube", i)
+                    post_youtube(out, yt_title, "Subscribe for more!\n\n#Shorts #Viral")
+
+                    total += 1
+
+            posted.append(url)
+            save_log(posted)
+            try: os.remove(src)
+            except: pass
+
+    logger.info(f"Done. Processed {total} videos.")
