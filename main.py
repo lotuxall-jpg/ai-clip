@@ -47,7 +47,7 @@ def download_video(url):
     "noplaylist": True,
     "quiet": False
 }
-    }
+    
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
